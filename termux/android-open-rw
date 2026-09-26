@@ -1,0 +1,14 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: android-open-rw <file>" >&2
+    exit 2
+fi
+
+FILE="$1"
+
+exec /system/bin/am start --user 0 \
+    -n com.remotevault.openrw/.MainActivity \
+    --es path "$FILE" \
+    >/dev/null
