@@ -5,11 +5,15 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.media.MediaScannerConnection;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -137,12 +141,47 @@ public class MainActivity extends Activity {
         if (intent == null) return null;
 
         String fromExtra = intent.getStringExtra(EXTRA_PATH);
-        if (fromExtra != null && !fromExtra.trim().isEmpty()) return fromExtra.trim();
+        if (fromExtra != null && !fromExtra.trim().isEmpty()) {
+            return fromExtra.trim();
+        }
 
         Uri data = intent.getData();
-        if (data != null && "file".equalsIgnoreCase(data.getScheme())) {
+        if (data == null) return null;
+
+        if ("file".equalsIgnoreCase(data.getScheme())) {
             return data.getPath();
         }
+
+        if ("content".equalsIgnoreCase(data.getScheme())) {
+            try (Cursor cursor = getContentResolver().query(
+                    data,
+                    new String[]{OpenableColumns.DISPLAY_NAME},
+                    null,
+                    null,
+                    null)) {
+
+                if (cursor != null && cursor.moveToFirst()) {
+                    int column =
+                            cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+
+                    if (column >= 0) {
+                        String name = cursor.getString(column);
+
+                        if (name != null && !name.trim().isEmpty()) {
+                            return name.trim();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            String last = data.getLastPathSegment();
+
+            if (last != null && !last.trim().isEmpty()) {
+                return last.trim();
+            }
+        }
+
         return null;
     }
 
@@ -220,27 +259,190 @@ public class MainActivity extends Activity {
 
     private void openPendingFile() {
         Uri tree = getSavedTreeUri();
-        if (tree == null || pendingPath == null) return;
 
-        List<String> relativeSegments = relativeSegmentsForPath(pendingPath);
-        if (relativeSegments.isEmpty()) {
-            Toast.makeText(this, "Could not determine the cached filename.", Toast.LENGTH_LONG).show();
+        if (tree == null || pendingPath == null) {
+            return;
+        }
+
+        String fileName = new File(pendingPath).getName();
+
+        if (fileName == null || fileName.trim().isEmpty()) {
+            Toast.makeText(
+                    this,
+                    "Could not determine cached filename.",
+                    Toast.LENGTH_LONG
+            ).show();
             return;
         }
 
         try {
-            Uri documentUri = resolveDocument(tree, relativeSegments);
-            if (documentUri == null) {
-                Toast.makeText(this,
-                        "The file was not found inside the selected cache folder: " +
-                                relativeSegments.get(relativeSegments.size() - 1),
-                        Toast.LENGTH_LONG).show();
+            String treeId =
+                    DocumentsContract.getTreeDocumentId(tree);
+
+            /*
+             * Example tree:
+             *
+             * primary:Documents/Obsidian Remote Cache
+             *
+             * Instead of querying/enumerating the folder, construct
+             * the child document ID directly:
+             *
+             * primary:Documents/Obsidian Remote Cache/<filename>
+             *
+             * Our persisted tree permission includes descendants.
+             */
+            String childId =
+                    treeId + "/" + fileName;
+
+            Uri childDocumentUri =
+                    DocumentsContract.buildDocumentUriUsingTree(
+                            tree,
+                            childId
+                    );
+
+            String mime = mimeForName(fileName);
+
+            /*
+             * First try immediately. If Android already knows this
+             * document in MediaStore, this is the fast path.
+             */
+            try {
+                Uri mediaUri =
+                        MediaStore.getMediaUri(
+                                this,
+                                childDocumentUri
+                        );
+
+                if (mediaUri != null) {
+                    launchMediaUri(mediaUri, mime);
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+
+            if (!treeId.startsWith("primary:")) {
+                Toast.makeText(
+                        this,
+                        "Cache folder is not on primary Android storage.",
+                        Toast.LENGTH_LONG
+                ).show();
                 return;
             }
 
-            openDocumentReadWrite(documentUri, relativeSegments.get(relativeSegments.size() - 1));
-        } catch (Exception e) {
-            Toast.makeText(this, "Could not open working copy: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            String relative =
+                    treeId.substring("primary:".length());
+
+            while (relative.startsWith("/")) {
+                relative = relative.substring(1);
+            }
+
+            File physicalFile =
+                    new File(
+                            Environment.getExternalStorageDirectory(),
+                            relative + "/" + fileName
+                    );
+
+            Toast.makeText(
+                    this,
+                    "Preparing new working copy…",
+                    Toast.LENGTH_SHORT
+            ).show();
+
+            /*
+             * Register newly-created Termux files with MediaStore.
+             *
+             * IMPORTANT:
+             * We do NOT use scannedUri directly. That was the cause
+             * of the SecurityException in v1.0.6.
+             *
+             * After scanning, convert our SAF-authorized document URI
+             * to its MediaStore equivalent instead.
+             */
+            MediaScannerConnection.scanFile(
+                    this,
+                    new String[]{physicalFile.getAbsolutePath()},
+                    new String[]{mime},
+                    (path, scannedUri) ->
+                            runOnUiThread(() -> {
+                                try {
+                                    Uri mediaUri =
+                                            MediaStore.getMediaUri(
+                                                    MainActivity.this,
+                                                    childDocumentUri
+                                            );
+
+                                    if (mediaUri == null) {
+                                        Toast.makeText(
+                                                MainActivity.this,
+                                                "File was scanned, but Android could not map it to MediaStore.",
+                                                Toast.LENGTH_LONG
+                                        ).show();
+                                        return;
+                                    }
+
+                                    launchMediaUri(
+                                            mediaUri,
+                                            mime
+                                    );
+
+                                } catch (Throwable t) {
+                                    showFatal(
+                                            "SAF → MEDIASTORE",
+                                            t
+                                    );
+                                }
+                            })
+            );
+
+        } catch (Throwable t) {
+            showFatal(
+                    "OPEN WORKING COPY",
+                    t
+            );
+        }
+    }
+
+    private void launchMediaUri(Uri mediaUri, String mime) {
+        /*
+         * Match the successful Samsung My Files handoff
+         * captured with Intent Probe:
+         *
+         * ACTION_VIEW
+         * application/pdf
+         * content://media/external/file/<id>
+         * READ grant only
+         * no ClipData
+         */
+        Intent openIntent =
+                new Intent(Intent.ACTION_VIEW);
+
+        openIntent.setDataAndType(
+                mediaUri,
+                mime
+        );
+
+        openIntent.addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP
+        );
+
+        try {
+            Intent chooser =
+                    Intent.createChooser(
+                            openIntent,
+                            "Open working copy"
+                    );
+
+            startActivity(chooser);
+            finish();
+
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(
+                    this,
+                    "No Android app can open this file type.",
+                    Toast.LENGTH_LONG
+            ).show();
         }
     }
 
@@ -334,6 +536,29 @@ public class MainActivity extends Activity {
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, "No Android app can open this file type.", Toast.LENGTH_LONG).show();
         }
+    }
+
+
+    private void showFatal(String stage, Throwable t) {
+        StringBuilder msg = new StringBuilder();
+
+        msg.append(stage)
+           .append("\n")
+           .append(t.getClass().getName())
+           .append("\n")
+           .append(t.getMessage());
+
+        Toast.makeText(
+                this,
+                msg.toString(),
+                Toast.LENGTH_LONG
+        ).show();
+
+        android.util.Log.e(
+                "RemoteVaultOpenRW",
+                stage,
+                t
+        );
     }
 
     private String mimeForName(String fileName) {

@@ -8,7 +8,6 @@ fi
 
 FILE="$1"
 
-exec /system/bin/am start --user 0 \
-    -n com.remotevault.openrw/.MainActivity \
-    --es path "$FILE" \
-    >/dev/null
+exec /data/data/com.termux/files/usr/bin/termux-open \
+    --content-type application/vnd.remotevault.openrw \
+    "$FILE"
